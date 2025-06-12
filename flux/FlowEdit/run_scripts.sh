@@ -1,0 +1,1 @@
+python run_script.py --exp_yaml FLUX_exp.yaml
