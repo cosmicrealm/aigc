@@ -10,8 +10,8 @@ from diffusers import FluxKontextDegPipeline
 
 
 pretrained_model_name_or_path = "/vepfs-d-data/q-xbyd/cv/users/zhangjinyang/models/FLUX.1-Kontext-dev"
-output_image_path = "generated_image_withoutlora.png"
-prompt = "add a glasses and a purple hat to the sks dog"
+output_image_path = "deg_test.png"
+prompt = "make the pic clear and sharp, add a red glasses and a purple hat"
 
 # 参考图像路径
 deg_image_path = "./asserts/00000000.png"  # 你需要准备一张图片
@@ -50,7 +50,7 @@ if isinstance(deg_image, Image.Image):
 deg_image = deg_image.to(dtype=data_type, device=pipe.device)
 
 with torch.no_grad():
-    images = pipe(prompt=prompt, image=deg_image, deg_image=deg_image,num_inference_steps=30).images
+    images = pipe(prompt=prompt, image=deg_image, deg_image=deg_image,num_inference_steps=30,height=512,width=512).images
 
 for idx, img in enumerate(images):
     img.save(f"{output_image_path.replace('.png', f'_{idx}.png')}")
