@@ -1,5 +1,6 @@
 import argparse
 import warnings
+import os
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")

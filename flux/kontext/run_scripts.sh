@@ -15,16 +15,12 @@ accelerate launch train_dreambooth_lora_flux_kontext.py \
   --gradient_checkpointing \
   --optimizer="adamw" \
   --use_8bit_adam \
-  --cache_latents \
   --learning_rate=1e-4 \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
   --max_train_steps=500 \
   --seed="0" 
 
-
-# Run tests
-pytest test_dreambooth_lora_flux_kontext.py
 
 
 
@@ -37,6 +33,7 @@ accelerate launch train_deg_lora_flux_kontext.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --instance_data_dir=$INSTANCE_DIR \
   --output_dir=$OUTPUT_DIR \
+  --rank=16 \
   --mixed_precision="bf16" \
   --instance_prompt="$DEFAULT_PROMPT" \
   --resolution=512 \
@@ -46,7 +43,6 @@ accelerate launch train_deg_lora_flux_kontext.py \
   --gradient_checkpointing \
   --optimizer="adamw" \
   --use_8bit_adam \
-  --cache_latents \
   --learning_rate=1e-4 \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
