@@ -7,11 +7,47 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--hr_root",
         type=str,
-        default="/vepfs-d-data/q-xbyd/cv/users/zhangjinyang/datasets/datasets/sr/ffhq-dataset/images512x512",
+        default="/vepfs-d-data/q-xbyd/cv/users/zhangjinyang/datasets/datasets/sr/ffhq-dataset/images1024x1024",
         help=(
             "The root directory containing the high-resolution training data. "
             "This should be a folder containing images, or a dataset from the HuggingFace hub."
         ),
+    )
+    parser.add_argument(
+        "--degradation_types",
+        type=str,
+        default="downsample",
+        help="Comma-separated list of degradation types to apply. Options: downsample,noise,blur,jpeg",
+    )
+    parser.add_argument(
+        "--use_bucket_sampler",
+        action="store_true",
+        default=False,
+        help="Use bucket-based dataset and sampler to group similar aspect ratios",
+    )
+    parser.add_argument(
+        "--noise_level",
+        type=float,
+        default=0.02,
+        help="Noise level to add (if noise degradation is enabled)",
+    )
+    parser.add_argument(
+        "--blur_radius",
+        type=float,
+        default=1.0,
+        help="Blur radius to apply (if blur degradation is enabled)",
+    )
+    parser.add_argument(
+        "--jpeg_quality",
+        type=int,
+        default=75,
+        help="JPEG compression quality (if jpeg degradation is enabled)",
+    )
+    parser.add_argument(
+        "--perceptual_loss",
+        action="store_true",
+        default=False,
+        help="Use perceptual loss in addition to L2 loss",
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",

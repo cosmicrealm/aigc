@@ -32,6 +32,11 @@ from peft.utils import get_peft_model_state_dict
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, T5TokenizerFast
+import torch.nn.functional as F
+
+# 添加用于感知损失的VGG模型
+import torchvision.models as models
+import torch.nn as nn
 
 import diffusers
 from diffusers import (
@@ -64,13 +69,12 @@ from utils.utils import (
 
 from utils.parse import parse_args
 from my_dataset.dataset_deg_paired import DegDataset
+from my_dataset.dataset_deg_bucket import DegBucketDataset, BucketBatchSampler, parse_buckets_string
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__)
-
-
 
 
 def main(args):
@@ -374,19 +378,53 @@ def main(args):
             safeguard_warmup=args.prodigy_safeguard_warmup,
         )
 
-    train_dataset = DegDataset(
-        hr_data_root=args.hr_root,
-        instance_prompt= args.instance_prompt, 
-        lr_scale=8,
-        repeats= args.repeats,
-    )
-    sampler = torch.utils.data.DistributedSampler(train_dataset)
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        sampler=sampler,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
+    # 根据参数选择使用不同的数据集实现
+    if args.use_bucket_sampler:
+        # 使用基于bucket的数据集
+        if args.aspect_ratio_buckets is not None:
+            buckets = parse_buckets_string(args.aspect_ratio_buckets)
+        else:
+            buckets = [(args.resolution, args.resolution)]
+        logger.info(f"使用Bucket采样器模式，解析的宽高比buckets: {buckets}")
+        
+        train_dataset = DegBucketDataset(
+            hr_data_root=args.hr_root,
+            instance_prompt=args.instance_prompt,
+            buckets=buckets,
+            repeats=args.repeats,
+            center_crop=args.center_crop,
+            degradation_types=args.degradation_types.split(','),
+            noise_level=args.noise_level,
+            blur_radius=args.blur_radius,
+            jpeg_quality=args.jpeg_quality
+        )
+        
+        # 使用BucketBatchSampler进行批处理
+        batch_sampler = BucketBatchSampler(train_dataset, batch_size=args.train_batch_size, drop_last=False)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=args.dataloader_num_workers,
+        )
+    else:
+        # 使用普通的退化数据集
+        train_dataset = DegDataset(
+            hr_data_root=args.hr_root,
+            instance_prompt=args.instance_prompt, 
+            lr_scale=8,
+            repeats=args.repeats,
+            degradation_types=args.degradation_types.split(','),
+            noise_level=args.noise_level,
+            blur_radius=args.blur_radius,
+            jpeg_quality=args.jpeg_quality
+        )
+        sampler = torch.utils.data.DistributedSampler(train_dataset)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            sampler=sampler,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
 
     if not args.train_text_encoder:
         tokenizers = [tokenizer_one, tokenizer_two]
@@ -546,6 +584,12 @@ def main(args):
         while len(sigma.shape) < n_dim:
             sigma = sigma.unsqueeze(-1)
         return sigma
+        
+    # 初始化感知损失
+    perceptual_loss_model = None
+    if args.perceptual_loss:
+        logger.info("Using perceptual loss for training")
+        perceptual_loss_model = VGGPerceptualLoss().to(accelerator.device)
 
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -603,11 +647,21 @@ def main(args):
                 indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
                 timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input_control.device)
 
-                # Add noise according to flow matching.
-                # zt = (1 - texp) * x + texp * z1
+                # Add interpolation according to flow matching.
+                # zt = (1 - t) * z0 + t * z1 (interpolating between control and target images)
                 sigmas = get_sigmas(timesteps, n_dim=model_input_control.ndim, dtype=model_input_control.dtype)
-                noisy_model_input = (1.0 - sigmas) * model_input_control + sigmas * noise
-
+                
+                # Scale model_input_target to match the scaling of model_input_control
+                model_input_target = (model_input_target - vae_config_shift_factor) * vae_config_scaling_factor
+                model_input_target = model_input_target.to(dtype=weight_dtype)
+                
+                # Generate intermediate point in the flow (interpolation between z0 and z1)
+                interpolated_latent = (1.0 - sigmas) * model_input_control + sigmas * model_input_target
+                
+                # Add some noise to avoid deterministic paths
+                noise_scale = 0.1  # Small noise scale to maintain overall direction
+                noisy_model_input = interpolated_latent + noise_scale * noise * sigmas
+                
                 packed_noisy_model_input = FluxKontextPipeline._pack_latents(
                     noisy_model_input,
                     batch_size=model_input_control.shape[0],
@@ -646,16 +700,35 @@ def main(args):
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # flow matching loss
-                target = noise - model_input_target
-
-
-                # Compute regular loss.
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                # Flow matching loss: model should predict the optimal vector field (direction)
+                # to move from current point to target (velocity field)
+                flow_target = model_input_target - model_input_control  # True velocity field (z₁ - z₀)
+                
+                # 重建损失 (L2 loss) - The model should predict the correct direction
+                l2_loss = torch.mean(
+                    (weighting.float() * (model_pred.float() - flow_target.float()) ** 2).reshape(flow_target.shape[0], -1),
                     1,
                 )
-                loss = loss.mean()
+                l2_loss = l2_loss.mean()
+                
+                # 总损失初始化为L2损失
+                loss = l2_loss
+                
+                # 如果启用感知损失，添加到总损失中
+                if args.perceptual_loss and perceptual_loss_model is not None:
+                    # 将latent转回像素空间用于感知损失计算
+                    with torch.no_grad():
+                        # 解码当前预测结果和理想流场方向
+                        pred_direction_pixels = vae.decode((model_pred / vae_config_scaling_factor) + vae_config_shift_factor).sample
+                        true_direction_pixels = vae.decode((flow_target / vae_config_scaling_factor) + vae_config_shift_factor).sample
+                    
+                    # 计算感知损失，权重为0.1
+                    p_loss = perceptual_loss_model(pred_direction_pixels, true_direction_pixels) * 0.1
+                    loss = loss + p_loss
+                    
+                    # 记录不同损失的值
+                    if accelerator.is_main_process and step % 10 == 0:
+                        logger.info(f"Step {step}: L2 Loss: {l2_loss.item():.4f}, Perceptual Loss: {p_loss.item():.4f}")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -791,6 +864,43 @@ def main(args):
         images = None
 
     accelerator.end_training()
+
+
+# 定义VGG特征提取器，用于感知损失计算
+class VGGPerceptualLoss(nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        vgg = models.vgg16(pretrained=True)
+        blocks = []
+        blocks.append(vgg.features[:4].eval())
+        blocks.append(vgg.features[4:9].eval())
+        blocks.append(vgg.features[9:16].eval())
+        blocks.append(vgg.features[16:23].eval())
+        for bl in blocks:
+            for p in bl.parameters():
+                p.requires_grad = False
+        self.blocks = nn.ModuleList(blocks)
+        self.resize = resize
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, input, target):
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        input = (input - self.mean) / self.std
+        target = (target - self.mean) / self.std
+        if self.resize:
+            input = F.interpolate(input, mode='bilinear', size=(224, 224), align_corners=False)
+            target = F.interpolate(target, mode='bilinear', size=(224, 224), align_corners=False)
+        loss = 0.0
+        x = input
+        y = target
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += F.l1_loss(x, y)
+        return loss
 
 
 if __name__ == "__main__":
